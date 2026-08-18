@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PWM Fan Curve Comparator</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
+<style>
+  :root {
+    --surface-1: #1a1a19;
+    --surface-2: #232322;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid-line: #2c2c2a;
+    --border: rgba(255,255,255,0.10);
+    --series-1: #3987e5; /* Old Fan - blue */
+    --series-2: #d95926; /* New Fan - orange */
+  }
+  body { background: #0d0d0d; color: var(--text-primary); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
+  input[type="range"] { accent-color: var(--accent, var(--series-1)); }
+</style>
+</head>
+<body class="h-screen overflow-hidden">
+<div id="app" class="h-screen flex flex-col p-4 gap-4"></div>
+
+<script type="text/babel" data-presets="none"></script>
+<script>
+const { createApp, ref, reactive, computed, onMounted, watch } = Vue;
+
+const App = {
+  setup() {
+    // Profile factory
+    function makeProfile(overrides) {
+      return reactive({
+        name: overrides.name,
+        color: overrides.color,
+        minRpm: overrides.minRpm,
+        maxRpm: overrides.maxRpm,
+        startTemp: overrides.startTemp,
+        fullTemp: overrides.fullTemp,
+        startPwm: overrides.startPwm,
+        fanOffEnabled: overrides.fanOffEnabled || false,
+        fanOffTemp: overrides.fanOffTemp,
+        deltaTempEnabled: overrides.deltaTempEnabled || false,
+        deltaTemp: overrides.deltaTemp,
+        dragEnabled: overrides.dragEnabled || false,
+      });
+    }
+
+    const oldFan = makeProfile({
+      name: 'Old Fan',
+      color: 'var(--series-1)',
+      minRpm: 200,
+      maxRpm: 1700,
+      startTemp: 25,
+      fullTemp: 80,
+      startPwm: 130,
+      fanOffEnabled: false,
+      fanOffTemp: 20,
+      deltaTempEnabled: false,
+      deltaTemp: 1,
+    });
+
+    const newFan = makeProfile({
+      name: 'New Fan',
+      color: 'var(--series-2)',
+      minRpm: 400,
+      maxRpm: 2500,
+      startTemp: 23,
+      fullTemp: 130,
+      startPwm: 69,
+      fanOffEnabled: false,
+      fanOffTemp: 20,
+      deltaTempEnabled: false,
+      deltaTemp: 1,
+    });
+
+    // Base ramp, ignoring fan-off / hysteresis: below startTemp -> RPM from startPwm,
+    // linear ramp to maxRpm between startTemp and fullTemp, flat at maxRpm above.
+    function baseRpmAt(temp, p) {
+      const startRpm = p.minRpm + (p.startPwm / 255) * (p.maxRpm - p.minRpm);
+      if (temp <= p.startTemp) return startRpm;
+      if (temp >= p.fullTemp) return p.maxRpm;
+      const frac = (temp - p.startTemp) / (p.fullTemp - p.startTemp);
+      return startRpm + frac * (p.maxRpm - startRpm);
+    }
+
+    // Simulates one directional sweep (rising or falling), applying two independent
+    // controls that mirror BIOS fan control behavior:
+    // - Fan Off: fan is fully off (0 RPM) below fanOffTemp. This is a plain threshold
+    //   on its own; when Delta Temp is also enabled it gets a hysteresis band so the
+    //   fan turns off only once temp falls below fanOffTemp - deltaTemp, and back on
+    //   once temp rises to fanOffTemp again (prevents chatter right at the threshold).
+    // - Delta Temp: step hysteresis applied along the *entire* curve, not just at
+    //   fan-off. RPM only updates once temp has moved deltaTemp degrees from the last
+    //   temperature RPM was committed at, so the output holds its last value through
+    //   small fluctuations and only "jumps" once a full delta-sized move has happened.
+    function sweepRpm(temps, p, direction) {
+      const seq = direction === 'rising' ? temps : [...temps].reverse();
+      const result = new Map();
+
+      let fanOn = direction === 'falling'; // falling sweep starts hot, fan already on
+      let lastCommitTemp = seq[0];
+      let lastRpm = null;
+
+      for (const temp of seq) {
+        if (p.fanOffEnabled) {
+          if (p.deltaTempEnabled) {
+            if (fanOn && temp < p.fanOffTemp - p.deltaTemp) fanOn = false;
+            else if (!fanOn && temp >= p.fanOffTemp) fanOn = true;
+          } else {
+            fanOn = temp >= p.fanOffTemp;
+          }
+        } else {
+          fanOn = true;
+        }
+
+        if (!fanOn) {
+          result.set(temp, 0);
+          lastRpm = 0;
+          lastCommitTemp = temp;
+          continue;
+        }
+
+        if (p.deltaTempEnabled && lastRpm !== null && Math.abs(temp - lastCommitTemp) < p.deltaTemp) {
+          result.set(temp, lastRpm);
+          continue;
+        }
+
+        const rpm = Math.round(baseRpmAt(temp, p));
+        result.set(temp, rpm);
+        lastRpm = rpm;
+        lastCommitTemp = temp;
+      }
+      return temps.map(t => ({ x: t, y: result.get(t) }));
+    }
+
+    const temps = [];
+    for (let t = 15; t <= 150; t += 2) temps.push(t);
+
+    const chartCanvas = ref(null);
+    let chartInstance = null;
+
+    function profileDatasets(p, hex) {
+      const directional = p.fanOffEnabled || p.deltaTempEnabled;
+      if (!directional) {
+        return [{
+          label: p.name,
+          data: sweepRpm(temps, p, 'rising'),
+          borderColor: hex,
+          backgroundColor: hex,
+          borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 5,
+          pointHitRadius: 10,
+          tension: 0,
+        }];
+      }
+      return [
+        {
+          label: `${p.name} (heating)`,
+          data: sweepRpm(temps, p, 'rising'),
+          borderColor: hex,
+          backgroundColor: hex,
+          borderWidth: 2,
+          pointRadius: 0,
+          pointHoverRadius: 5,
+          pointHitRadius: 10,
+          tension: 0,
+        },
+        {
+          label: `${p.name} (cooling)`,
+          data: sweepRpm(temps, p, 'falling'),
+          borderColor: hex,
+          backgroundColor: hex,
+          borderWidth: 2,
+          borderDash: [6, 4],
+          pointRadius: 0,
+          pointHoverRadius: 5,
+          pointHitRadius: 10,
+          tension: 0,
+        },
+      ];
+    }
+
+    // Draggable knee handles: [startTemp, startRpm] and [fullTemp, maxRpm].
+    function handleDataset(p, hex) {
+      const startRpm = p.minRpm + (p.startPwm / 255) * (p.maxRpm - p.minRpm);
+      return {
+        label: `${p.name} handles`,
+        data: [
+          { x: p.startTemp, y: Math.round(startRpm) },
+          { x: p.fullTemp, y: p.maxRpm },
+        ],
+        showLine: false,
+        borderColor: hex,
+        backgroundColor: hex,
+        pointRadius: 6,
+        pointHoverRadius: 8,
+        pointHitRadius: 14,
+        pointBorderColor: '#ffffff',
+        pointBorderWidth: 1.5,
+        order: -1,
+        isHandles: true,
+        profile: p,
+      };
+    }
+
+    function buildDatasets() {
+      const datasets = [
+        ...profileDatasets(oldFan, '#3987e5'),
+        ...profileDatasets(newFan, '#d95926'),
+      ];
+      if (oldFan.dragEnabled) datasets.push(handleDataset(oldFan, '#3987e5'));
+      if (newFan.dragEnabled) datasets.push(handleDataset(newFan, '#d95926'));
+      return datasets;
+    }
+
+    onMounted(() => {
+      const ctx = chartCanvas.value.getContext('2d');
+      chartInstance = new Chart(ctx, {
+        type: 'line',
+        data: { datasets: buildDatasets() },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          animation: { duration: 200 },
+          interaction: { mode: 'nearest', axis: 'x', intersect: false },
+          plugins: {
+            legend: {
+              display: true,
+              position: 'top',
+              align: 'end',
+              labels: { color: '#c3c2b7', usePointStyle: true, pointStyle: 'line', boxWidth: 24, font: { size: 12 } },
+            },
+            tooltip: {
+              backgroundColor: '#232322',
+              titleColor: '#ffffff',
+              bodyColor: '#c3c2b7',
+              borderColor: 'rgba(255,255,255,0.10)',
+              borderWidth: 1,
+              padding: 10,
+              callbacks: {
+                title: (items) => `${items[0].parsed.x}°C`,
+                label: (item) => `${item.dataset.label}: ${item.parsed.y} RPM`,
+              },
+            },
+            annotation: {
+              annotations: {
+                operatingRange: {
+                  type: 'box',
+                  xMin: 45,
+                  xMax: 78,
+                  backgroundColor: 'rgba(201,133,0,0.10)',
+                  borderColor: 'rgba(201,133,0,0.5)',
+                  borderWidth: 1,
+                  label: {
+                    display: true,
+                    content: '45–78°C',
+                    position: { x: 'center', y: 'start' },
+                    color: '#c3c2b7',
+                    font: { size: 11 },
+                    backgroundColor: 'transparent',
+                    yAdjust: 4,
+                  },
+                },
+              },
+            },
+          },
+          scales: {
+            x: {
+              type: 'linear',
+              min: 15,
+              max: 150,
+              title: { display: true, text: 'Temperature (°C)', color: '#898781', font: { size: 12 } },
+              ticks: { color: '#898781', maxTicksLimit: 9, stepSize: 15 },
+              grid: { color: '#2c2c2a' },
+              border: { color: '#383835' },
+            },
+            y: {
+              title: { display: true, text: 'Fan Speed (RPM)', color: '#898781', font: { size: 12 } },
+              ticks: { color: '#898781' },
+              grid: { color: '#2c2c2a' },
+              border: { color: '#383835' },
+              beginAtZero: true,
+            },
+          },
+        },
+      });
+      attachDragHandlers(ctx.canvas);
+    });
+
+    function refreshChart() {
+      if (!chartInstance) return;
+      chartInstance.data.datasets = buildDatasets();
+      chartInstance.update('none');
+    }
+
+    watch([oldFan, newFan], refreshChart, { deep: true });
+
+    // Drag-to-adjust: hit-test the handle points (start-temp/start-rpm knee and
+    // full-speed-temp/max-rpm knee) and drag them to update the profile live.
+    const TEMP_MIN = 15, TEMP_MAX = 150, RPM_MIN = 0, RPM_MAX = 3500;
+    let dragging = null; // { profile, pointIndex }
+
+    function findHandleAt(canvasX, canvasY) {
+      const chart = chartInstance;
+      for (const ds of chart.data.datasets) {
+        if (!ds.isHandles) continue;
+        const meta = chart.getDatasetMeta(chart.data.datasets.indexOf(ds));
+        for (let i = 0; i < meta.data.length; i++) {
+          const el = meta.data[i];
+          const dx = el.x - canvasX, dy = el.y - canvasY;
+          if (Math.sqrt(dx * dx + dy * dy) <= 14) {
+            return { profile: ds.profile, pointIndex: i };
+          }
+        }
+      }
+      return null;
+    }
+
+    function applyDrag(profile, pointIndex, temp, rpm) {
+      const clampedTemp = Math.min(TEMP_MAX, Math.max(TEMP_MIN, Math.round(temp)));
+      const clampedRpm = Math.min(RPM_MAX, Math.max(RPM_MIN, Math.round(rpm)));
+      if (pointIndex === 0) {
+        // Start knee: x -> startTemp (clamped below fullTemp); y -> startPwm derived from rpm.
+        profile.startTemp = Math.min(clampedTemp, profile.fullTemp - 1);
+        const span = profile.maxRpm - profile.minRpm;
+        const rpmClamped = Math.min(profile.maxRpm, Math.max(profile.minRpm, clampedRpm));
+        profile.startPwm = span === 0 ? 0 : Math.round(((rpmClamped - profile.minRpm) / span) * 255);
+      } else {
+        // Full-speed knee: x -> fullTemp only. Max RPM is a fixed hardware ceiling,
+        // not adjustable from the curve — the knee only moves horizontally.
+        profile.fullTemp = Math.max(clampedTemp, profile.startTemp + 1);
+      }
+    }
+
+    function attachDragHandlers(canvas) {
+      canvas.addEventListener('pointerdown', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left, y = e.clientY - rect.top;
+        const hit = findHandleAt(x, y);
+        if (hit) {
+          dragging = hit;
+          canvas.setPointerCapture(e.pointerId);
+          canvas.style.cursor = hit.pointIndex === 1 ? 'ew-resize' : 'grabbing';
+        }
+      });
+      canvas.addEventListener('pointermove', (e) => {
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left, y = e.clientY - rect.top;
+        if (!dragging) {
+          const hit = findHandleAt(x, y);
+          canvas.style.cursor = hit ? (hit.pointIndex === 1 ? 'ew-resize' : 'grab') : '';
+          return;
+        }
+        const xScale = chartInstance.scales.x, yScale = chartInstance.scales.y;
+        const temp = xScale.getValueForPixel(x);
+        const rpm = yScale.getValueForPixel(y);
+        applyDrag(dragging.profile, dragging.pointIndex, temp, rpm);
+      });
+      const endDrag = (e) => {
+        if (dragging) {
+          canvas.releasePointerCapture(e.pointerId);
+          canvas.style.cursor = '';
+        }
+        dragging = null;
+      };
+      canvas.addEventListener('pointerup', endDrag);
+      canvas.addEventListener('pointercancel', endDrag);
+      canvas.addEventListener('pointerleave', () => { if (!dragging) canvas.style.cursor = ''; });
+    }
+
+    const oldFanStats = computed(() => ({
+      startRpm: Math.round(oldFan.minRpm + (oldFan.startPwm / 255) * (oldFan.maxRpm - oldFan.minRpm)),
+    }));
+    const newFanStats = computed(() => ({
+      startRpm: Math.round(newFan.minRpm + (newFan.startPwm / 255) * (newFan.maxRpm - newFan.minRpm)),
+    }));
+
+    return { oldFan, newFan, chartCanvas, oldFanStats, newFanStats };
+  },
+  template: `
+    <div class="flex flex-col h-full max-w-[1600px] mx-auto w-full gap-3">
+      <header class="flex items-baseline justify-between shrink-0">
+        <div>
+          <h1 class="text-lg font-semibold tracking-tight">PWM Fan Curve Comparator</h1>
+          <p class="text-xs" style="color: var(--text-muted)">Simulate and compare two fan speed profiles across temperature</p>
+        </div>
+      </header>
+
+      <div class="flex-1 min-h-0 flex flex-col lg:flex-row gap-4">
+
+        <!-- Old Fan Panel -->
+        <section class="w-full lg:w-[300px] shrink-0 rounded-lg border p-4 flex flex-col gap-4 overflow-y-auto" style="background: var(--surface-1); border-color: var(--border)">
+          <div class="flex items-center gap-2 shrink-0">
+            <span class="inline-block w-3 h-3 rounded-full" style="background: var(--series-1)"></span>
+            <h2 class="font-medium text-sm">{{ oldFan.name }}</h2>
+          </div>
+
+          <div class="flex flex-col gap-3" style="--accent: var(--series-1)">
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Min RPM</span><span class="font-mono" style="color: var(--text-primary)">{{ oldFan.minRpm }}</span></div>
+              <input type="range" min="0" max="1000" step="10" v-model.number="oldFan.minRpm" class="w-full" />
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Max RPM</span><span class="font-mono" style="color: var(--text-primary)">{{ oldFan.maxRpm }}</span></div>
+              <input type="range" min="1000" max="3500" step="10" v-model.number="oldFan.maxRpm" class="w-full" />
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Start Temp (Fan Start)</span><span class="font-mono" style="color: var(--text-primary)">{{ oldFan.startTemp }}°C</span></div>
+              <input type="range" min="15" max="50" step="1" v-model.number="oldFan.startTemp" class="w-full" />
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Full Speed Temp</span><span class="font-mono" style="color: var(--text-primary)">{{ oldFan.fullTemp }}°C</span></div>
+              <input type="range" min="50" max="150" step="1" v-model.number="oldFan.fullTemp" class="w-full" />
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Start PWM</span><span class="font-mono" style="color: var(--text-primary)">{{ oldFan.startPwm }}</span></div>
+              <input type="range" min="0" max="255" step="1" v-model.number="oldFan.startPwm" class="w-full" />
+            </div>
+          </div>
+
+          <div class="pt-2 border-t" style="border-color: var(--border)">
+            <label class="flex items-center gap-2 text-xs cursor-pointer" style="color: var(--text-secondary)">
+              <input type="checkbox" v-model="oldFan.dragEnabled" style="accent-color: var(--series-1)" />
+              Drag handles on chart
+            </label>
+          </div>
+
+          <div class="pt-2 border-t flex flex-col gap-2" style="border-color: var(--border)">
+            <label class="flex items-center gap-2 text-xs cursor-pointer" style="color: var(--text-secondary)">
+              <input type="checkbox" v-model="oldFan.fanOffEnabled" style="accent-color: var(--series-1)" />
+              Fan Off
+            </label>
+            <div v-if="oldFan.fanOffEnabled" style="--accent: var(--series-1)">
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Fan Off Temp</span><span class="font-mono" style="color: var(--text-primary)">{{ oldFan.fanOffTemp }}°C</span></div>
+              <input type="range" min="0" max="50" step="1" v-model.number="oldFan.fanOffTemp" class="w-full" />
+            </div>
+          </div>
+
+          <div class="pt-2 border-t flex flex-col gap-2" style="border-color: var(--border)">
+            <label class="flex items-center gap-2 text-xs cursor-pointer" style="color: var(--text-secondary)">
+              <input type="checkbox" v-model="oldFan.deltaTempEnabled" style="accent-color: var(--series-1)" />
+              Delta Temp (hysteresis)
+            </label>
+            <div v-if="oldFan.deltaTempEnabled" style="--accent: var(--series-1)">
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Delta Temp</span><span class="font-mono" style="color: var(--text-primary)">{{ oldFan.deltaTemp }}°C</span></div>
+              <input type="range" min="0" max="10" step="1" v-model.number="oldFan.deltaTemp" class="w-full" />
+            </div>
+          </div>
+
+          <div class="mt-auto pt-2 border-t text-xs flex justify-between" style="border-color: var(--border); color: var(--text-muted)">
+            <span>Speed at start temp</span>
+            <span class="font-mono" style="color: var(--text-secondary)">{{ oldFanStats.startRpm }} RPM</span>
+          </div>
+        </section>
+
+        <!-- New Fan Panel -->
+        <section class="w-full lg:w-[300px] shrink-0 rounded-lg border p-4 flex flex-col gap-4 overflow-y-auto" style="background: var(--surface-1); border-color: var(--border)">
+          <div class="flex items-center gap-2 shrink-0">
+            <span class="inline-block w-3 h-3 rounded-full" style="background: var(--series-2)"></span>
+            <h2 class="font-medium text-sm">{{ newFan.name }}</h2>
+          </div>
+
+          <div class="flex flex-col gap-3" style="--accent: var(--series-2)">
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Min RPM</span><span class="font-mono" style="color: var(--text-primary)">{{ newFan.minRpm }}</span></div>
+              <input type="range" min="0" max="1000" step="10" v-model.number="newFan.minRpm" class="w-full" />
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Max RPM</span><span class="font-mono" style="color: var(--text-primary)">{{ newFan.maxRpm }}</span></div>
+              <input type="range" min="1000" max="3500" step="10" v-model.number="newFan.maxRpm" class="w-full" />
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Start Temp (Fan Start)</span><span class="font-mono" style="color: var(--text-primary)">{{ newFan.startTemp }}°C</span></div>
+              <input type="range" min="15" max="50" step="1" v-model.number="newFan.startTemp" class="w-full" />
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Full Speed Temp</span><span class="font-mono" style="color: var(--text-primary)">{{ newFan.fullTemp }}°C</span></div>
+              <input type="range" min="50" max="150" step="1" v-model.number="newFan.fullTemp" class="w-full" />
+            </div>
+            <div>
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Start PWM</span><span class="font-mono" style="color: var(--text-primary)">{{ newFan.startPwm }}</span></div>
+              <input type="range" min="0" max="255" step="1" v-model.number="newFan.startPwm" class="w-full" />
+            </div>
+          </div>
+
+          <div class="pt-2 border-t" style="border-color: var(--border)">
+            <label class="flex items-center gap-2 text-xs cursor-pointer" style="color: var(--text-secondary)">
+              <input type="checkbox" v-model="newFan.dragEnabled" style="accent-color: var(--series-2)" />
+              Drag handles on chart
+            </label>
+          </div>
+
+          <div class="pt-2 border-t flex flex-col gap-2" style="border-color: var(--border)">
+            <label class="flex items-center gap-2 text-xs cursor-pointer" style="color: var(--text-secondary)">
+              <input type="checkbox" v-model="newFan.fanOffEnabled" style="accent-color: var(--series-2)" />
+              Fan Off
+            </label>
+            <div v-if="newFan.fanOffEnabled" style="--accent: var(--series-2)">
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Fan Off Temp</span><span class="font-mono" style="color: var(--text-primary)">{{ newFan.fanOffTemp }}°C</span></div>
+              <input type="range" min="0" max="50" step="1" v-model.number="newFan.fanOffTemp" class="w-full" />
+            </div>
+          </div>
+
+          <div class="pt-2 border-t flex flex-col gap-2" style="border-color: var(--border)">
+            <label class="flex items-center gap-2 text-xs cursor-pointer" style="color: var(--text-secondary)">
+              <input type="checkbox" v-model="newFan.deltaTempEnabled" style="accent-color: var(--series-2)" />
+              Delta Temp (hysteresis)
+            </label>
+            <div v-if="newFan.deltaTempEnabled" style="--accent: var(--series-2)">
+              <div class="flex justify-between text-xs mb-1"><span style="color: var(--text-secondary)">Delta Temp</span><span class="font-mono" style="color: var(--text-primary)">{{ newFan.deltaTemp }}°C</span></div>
+              <input type="range" min="0" max="10" step="1" v-model.number="newFan.deltaTemp" class="w-full" />
+            </div>
+          </div>
+
+          <div class="mt-auto pt-2 border-t text-xs flex justify-between" style="border-color: var(--border); color: var(--text-muted)">
+            <span>Speed at start temp</span>
+            <span class="font-mono" style="color: var(--text-secondary)">{{ newFanStats.startRpm }} RPM</span>
+          </div>
+        </section>
+
+        <!-- Chart -->
+        <section class="flex-1 min-w-0 rounded-lg border p-4 flex flex-col min-h-0" style="background: var(--surface-1); border-color: var(--border)">
+          <div class="flex-1 min-h-0 relative">
+            <canvas ref="chartCanvas"></canvas>
+          </div>
+        </section>
+
+      </div>
+    </div>
+  `,
+};
+
+createApp(App).mount('#app');
+</script>
+</body>
+</html>
