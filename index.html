@@ -22,10 +22,13 @@
   }
   body { background: #0d0d0d; color: var(--text-primary); font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
   input[type="range"] { accent-color: var(--accent, var(--series-1)); }
+  @media (min-width: 1024px) {
+    html, body { height: 100%; overflow: hidden; }
+  }
 </style>
 </head>
-<body class="h-screen overflow-hidden">
-<div id="app" class="h-screen flex flex-col p-4 gap-4"></div>
+<body>
+<div id="app" class="flex flex-col p-4 gap-4 lg:h-screen"></div>
 
 <script type="text/babel" data-presets="none"></script>
 <script>
@@ -385,7 +388,7 @@ const App = {
     return { oldFan, newFan, chartCanvas, oldFanStats, newFanStats };
   },
   template: `
-    <div class="flex flex-col h-full max-w-[1600px] mx-auto w-full gap-3">
+    <div class="flex flex-col lg:h-full max-w-[1600px] mx-auto w-full gap-3">
       <header class="flex items-baseline justify-between shrink-0">
         <div>
           <h1 class="text-lg font-semibold tracking-tight">PWM Fan Curve Comparator</h1>
@@ -393,7 +396,7 @@ const App = {
         </div>
       </header>
 
-      <div class="flex-1 min-h-0 flex flex-col lg:flex-row gap-4">
+      <div class="lg:flex-1 lg:min-h-0 flex flex-col lg:flex-row gap-4">
 
         <!-- Old Fan Panel -->
         <section class="w-full lg:w-[300px] shrink-0 rounded-lg border p-4 flex flex-col gap-4 overflow-y-auto" style="background: var(--surface-1); border-color: var(--border)">
@@ -526,7 +529,7 @@ const App = {
         </section>
 
         <!-- Chart -->
-        <section class="flex-1 min-w-0 rounded-lg border p-4 flex flex-col min-h-0" style="background: var(--surface-1); border-color: var(--border)">
+        <section class="lg:flex-1 min-w-0 rounded-lg border p-4 flex flex-col lg:min-h-0 h-[70vh] lg:h-auto shrink-0" style="background: var(--surface-1); border-color: var(--border)">
           <div class="flex-1 min-h-0 relative">
             <canvas ref="chartCanvas"></canvas>
           </div>
